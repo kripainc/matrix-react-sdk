@@ -1,5 +1,5 @@
 /*
-Copyright 2015, 2016, 2017, 2018, 2019, 2020 The Matrix.org Foundation C.I.C.
+Copyright 2015-2021 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import Matrix from 'matrix-js-sdk';
+import {createClient} from 'matrix-js-sdk/src/matrix';
 import React, {ReactNode} from 'react';
 import {MatrixClient} from "matrix-js-sdk/src/client";
 
@@ -30,6 +30,7 @@ import Login, {ISSOFlow} from "../../../Login";
 import dis from "../../../dispatcher/dispatcher";
 import SSOButtons from "../../views/elements/SSOButtons";
 import ServerPicker from '../../views/elements/ServerPicker';
+import {replaceableComponent} from "../../../utils/replaceableComponent";
 
 interface IProps {
     serverConfig: ValidatedServerConfig;
@@ -94,7 +95,7 @@ interface IState {
     // be seeing.
     serverIsAlive: boolean;
     serverErrorIsFatal: boolean;
-    serverDeadError: string;
+    serverDeadError?: ReactNode;
 
     // Our matrix client - part of state because we can't render the UI auth
     // component without it.
@@ -109,6 +110,7 @@ interface IState {
     ssoFlow?: ISSOFlow;
 }
 
+@replaceableComponent("structures.auth.Registration")
 export default class Registration extends React.Component<IProps, IState> {
     loginLogic: Login;
 
@@ -179,7 +181,7 @@ export default class Registration extends React.Component<IProps, IState> {
         }
 
         const {hsUrl, isUrl} = serverConfig;
-        const cli = Matrix.createClient({
+        const cli = createClient({
             baseUrl: hsUrl,
             idBaseUrl: isUrl,
         });
@@ -276,6 +278,7 @@ export default class Registration extends React.Component<IProps, IState> {
                     response.data.admin_contact,
                     {
                         'monthly_active_user': _td("This homeserver has hit its Monthly Active User limit."),
+                        'hs_blocked': _td("This homeserver has been blocked by it's administrator."),
                         '': _td("This homeserver has exceeded one of its resource limits."),
                     },
                 );
@@ -325,8 +328,7 @@ export default class Registration extends React.Component<IProps, IState> {
         // isn't a guest user since we'll usually have set a guest user session before
         // starting the registration process. This isn't perfect since it's possible
         // the user had a separate guest session they didn't actually mean to replace.
-        const sessionOwner = Lifecycle.getStoredSessionOwner();
-        const sessionIsGuest = Lifecycle.getStoredSessionIsGuest();
+        const [sessionOwner, sessionIsGuest] = await Lifecycle.getStoredSessionOwner();
         if (sessionOwner && !sessionIsGuest && sessionOwner !== response.userId) {
             console.log(
                 `Found a session for ${sessionOwner} but ${response.userId} has just registered.`,
@@ -434,6 +436,8 @@ export default class Registration extends React.Component<IProps, IState> {
             // ok fine, there's still no session: really go to the login page
             this.props.onLoginClick();
         }
+
+        return sessionLoaded;
     };
 
     private renderRegisterComponent() {
@@ -463,8 +467,7 @@ export default class Registration extends React.Component<IProps, IState> {
             let ssoSection;
             if (this.state.ssoFlow) {
                 let continueWithSection;
-                const providers = this.state.ssoFlow["org.matrix.msc2858.identity_providers"]
-                    || this.state.ssoFlow["identity_providers"] || [];
+                const providers = this.state.ssoFlow["org.matrix.msc2858.identity_providers"] || [];
                 // when there is only a single (or 0) providers we show a wide button with `Continue with X` text
                 if (providers.length > 1) {
                     // i18n: ssoButtons is a placeholder to help translators understand context
@@ -556,7 +559,12 @@ export default class Registration extends React.Component<IProps, IState> {
                             loggedInUserId: this.state.differentLoggedInUserId,
                         },
                     )}</p>
-                    <p><AccessibleButton element="span" className="mx_linkButton" onClick={this.onLoginClickWithCheck}>
+                    <p><AccessibleButton element="span" className="mx_linkButton" onClick={async event => {
+                        const sessionLoaded = await this.onLoginClickWithCheck(event);
+                        if (sessionLoaded) {
+                            dis.dispatch({action: "view_welcome_page"});
+                        }
+                    }}>
                         {_t("Continue with previous account")}
                     </AccessibleButton></p>
                 </div>;

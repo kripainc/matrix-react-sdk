@@ -59,12 +59,10 @@ import {MatrixClientPeg} from './MatrixClientPeg';
 import PlatformPeg from './PlatformPeg';
 import Modal from './Modal';
 import { _t } from './languageHandler';
-import { createNewMatrixCall } from 'matrix-js-sdk/src/webrtc/call';
 import dis from './dispatcher/dispatcher';
 import WidgetUtils from './utils/WidgetUtils';
 import WidgetEchoStore from './stores/WidgetEchoStore';
 import SettingsStore from './settings/SettingsStore';
-import {generateHumanReadableId} from "./utils/NamingUtils";
 import {Jitsi} from "./widgets/Jitsi";
 import {WidgetType} from "./widgets/WidgetType";
 import {SettingLevel} from "./settings/SettingLevel";
@@ -81,12 +79,54 @@ import Analytics from './Analytics';
 import CountlyAnalytics from "./CountlyAnalytics";
 import {UIFeature} from "./settings/UIFeature";
 import { CallError } from "matrix-js-sdk/src/webrtc/call";
+import { logger } from 'matrix-js-sdk/src/logger';
+import DesktopCapturerSourcePicker from "./components/views/elements/DesktopCapturerSourcePicker"
+import { Action } from './dispatcher/actions';
+import VoipUserMapper from './VoipUserMapper';
+import { addManagedHybridWidget, isManagedHybridWidgetEnabled } from './widgets/ManagedHybrid';
+import { randomUppercaseString, randomLowercaseString } from "matrix-js-sdk/src/randomstring";
+import EventEmitter from 'events';
+import SdkConfig from './SdkConfig';
+import { ensureDMExists, findDMForUser } from './createRoom';
+
+export const PROTOCOL_PSTN = 'm.protocol.pstn';
+export const PROTOCOL_PSTN_PREFIXED = 'im.vector.protocol.pstn';
+export const PROTOCOL_SIP_NATIVE = 'im.vector.protocol.sip_native';
+export const PROTOCOL_SIP_VIRTUAL = 'im.vector.protocol.sip_virtual';
+
+const CHECK_PROTOCOLS_ATTEMPTS = 3;
+// Event type for room account data and room creation content used to mark rooms as virtual rooms
+// (and store the ID of their native room)
+export const VIRTUAL_ROOM_EVENT_TYPE = 'im.vector.is_virtual_room';
 
 enum AudioID {
     Ring = 'ringAudio',
     Ringback = 'ringbackAudio',
     CallEnd = 'callendAudio',
     Busy = 'busyAudio',
+}
+
+interface ThirdpartyLookupResponseFields {
+    /* eslint-disable camelcase */
+
+    // im.vector.sip_native
+    virtual_mxid?: string;
+    is_virtual?: boolean;
+
+    // im.vector.sip_virtual
+    native_mxid?: string;
+    is_native?: boolean;
+
+    // common
+    lookup_success?: boolean;
+
+    /* eslint-enable camelcase */
+}
+
+interface ThirdpartyLookupResponse {
+    userid: string,
+    protocol: string,
+    fields: ThirdpartyLookupResponseFields,
 }
 
 // Unlike 'CallType' in js-sdk, this one includes screen sharing
@@ -99,24 +139,30 @@ export enum PlaceCallType {
     ScreenSharing = 'screensharing',
 }
 
-function getRemoteAudioElement(): HTMLAudioElement {
-    // this needs to be somewhere at the top of the DOM which
-    // always exists to avoid audio interruptions.
-    // Might as well just use DOM.
-    const remoteAudioElement = document.getElementById("remoteAudio") as HTMLAudioElement;
-    if (!remoteAudioElement) {
-        console.error(
-            "Failed to find remoteAudio element - cannot play audio!" +
-            "You need to add an <audio/> to the DOM.",
-        );
-        return null;
-    }
-    return remoteAudioElement;
+export enum CallHandlerEvent {
+    CallsChanged = "calls_changed",
+    CallChangeRoom = "call_change_room",
 }
 
-export default class CallHandler {
-    private calls = new Map<string, MatrixCall>();
+export default class CallHandler extends EventEmitter {
+    private calls = new Map<string, MatrixCall>(); // roomId -> call
+    // Calls started as an attended transfer, ie. with the intention of transferring another
+    // call with a different party to this one.
+    private transferees = new Map<string, MatrixCall>(); // callId (target) -> call (transferee)
     private audioPromises = new Map<AudioID, Promise<void>>();
+    private dispatcherRef: string = null;
+    private supportsPstnProtocol = null;
+    private pstnSupportPrefixed = null; // True if the server only support the prefixed pstn protocol
+    private supportsSipNativeVirtual = null; // im.vector.protocol.sip_virtual and im.vector.protocol.sip_native
+    private pstnSupportCheckTimer: NodeJS.Timeout; // number actually because we're in the browser
+    // For rooms we've been invited to, true if they're from virtual user, false if we've checked and they aren't.
+    private invitedRoomsAreVirtual = new Map<string, boolean>();
+    private invitedRoomCheckInProgress = false;
+
+    // Map of the asserted identity users after we've looked them up using the API.
+    // We need to be be able to determine the mapped room synchronously, so we
+    // do the async lookup when we get new information and then store these mappings here
+    private assertedIdentityNativeUsers = new Map<string, string>();
 
     static sharedInstance() {
         if (!window.mxCallHandler) {
@@ -126,8 +172,28 @@ export default class CallHandler {
         return window.mxCallHandler;
     }
 
+    /*
+     * Gets the user-facing room associated with a call (call.roomId may be the call "virtual room"
+     * if a voip_mxid_translate_pattern is set in the config)
+     */
+    public roomIdForCall(call: MatrixCall): string {
+        if (!call) return null;
+
+        const voipConfig = SdkConfig.get()['voip'];
+
+        if (voipConfig && voipConfig.obeyAssertedIdentity) {
+            const nativeUser = this.assertedIdentityNativeUsers[call.callId];
+            if (nativeUser) {
+                const room = findDMForUser(MatrixClientPeg.get(), nativeUser);
+                if (room) return room.roomId
+            }
+        }
+
+        return VoipUserMapper.sharedInstance().nativeRoomForVirtualRoom(call.roomId) || call.roomId;
+    }
+
     start() {
-        dis.register(this.onAction);
+        this.dispatcherRef = dis.register(this.onAction);
         // add empty handlers for media actions, otherwise the media keys
         // end up causing the audio elements with our ring/ringback etc
         // audio clips in to play.
@@ -143,6 +209,8 @@ export default class CallHandler {
         if (SettingsStore.getValue(UIFeature.Voip)) {
             MatrixClientPeg.get().on('Call.incoming', this.onCallIncoming);
         }
+
+        this.checkProtocols(CHECK_PROTOCOLS_ATTEMPTS);
     }
 
     stop() {
@@ -150,6 +218,77 @@ export default class CallHandler {
         if (cli) {
             cli.removeListener('Call.incoming', this.onCallIncoming);
         }
+        if (this.dispatcherRef !== null) {
+            dis.unregister(this.dispatcherRef);
+            this.dispatcherRef = null;
+        }
+    }
+
+    private async checkProtocols(maxTries) {
+        try {
+            const protocols = await MatrixClientPeg.get().getThirdpartyProtocols();
+
+            if (protocols[PROTOCOL_PSTN] !== undefined) {
+                this.supportsPstnProtocol = Boolean(protocols[PROTOCOL_PSTN]);
+                if (this.supportsPstnProtocol) this.pstnSupportPrefixed = false;
+            } else if (protocols[PROTOCOL_PSTN_PREFIXED] !== undefined) {
+                this.supportsPstnProtocol = Boolean(protocols[PROTOCOL_PSTN_PREFIXED]);
+                if (this.supportsPstnProtocol) this.pstnSupportPrefixed = true;
+            } else {
+                this.supportsPstnProtocol = null;
+            }
+
+            dis.dispatch({action: Action.PstnSupportUpdated});
+
+            if (protocols[PROTOCOL_SIP_NATIVE] !== undefined && protocols[PROTOCOL_SIP_VIRTUAL] !== undefined) {
+                this.supportsSipNativeVirtual = Boolean(
+                    protocols[PROTOCOL_SIP_NATIVE] && protocols[PROTOCOL_SIP_VIRTUAL],
+                );
+            }
+
+            dis.dispatch({action: Action.VirtualRoomSupportUpdated});
+        } catch (e) {
+            if (maxTries === 1) {
+                console.log("Failed to check for protocol support and no retries remain: assuming no support", e);
+            } else {
+                console.log("Failed to check for protocol support: will retry", e);
+                this.pstnSupportCheckTimer = setTimeout(() => {
+                    this.checkProtocols(maxTries - 1);
+                }, 10000);
+            }
+        }
+    }
+
+    public getSupportsPstnProtocol() {
+        return this.supportsPstnProtocol;
+    }
+
+    public getSupportsVirtualRooms() {
+        return this.supportsPstnProtocol;
+    }
+
+    public pstnLookup(phoneNumber: string): Promise<ThirdpartyLookupResponse[]> {
+        return MatrixClientPeg.get().getThirdpartyUser(
+            this.pstnSupportPrefixed ? PROTOCOL_PSTN_PREFIXED : PROTOCOL_PSTN, {
+                'm.id.phone': phoneNumber,
+            },
+        );
+    }
+
+    public sipVirtualLookup(nativeMxid: string): Promise<ThirdpartyLookupResponse[]> {
+        return MatrixClientPeg.get().getThirdpartyUser(
+            PROTOCOL_SIP_VIRTUAL, {
+                'native_mxid': nativeMxid,
+            },
+        );
+    }
+
+    public sipNativeLookup(virtualMxid: string): Promise<ThirdpartyLookupResponse[]> {
+        return MatrixClientPeg.get().getThirdpartyUser(
+            PROTOCOL_SIP_NATIVE, {
+                'virtual_mxid': virtualMxid,
+            },
+        );
     }
 
     private onCallIncoming = (call) => {
@@ -173,6 +312,32 @@ export default class CallHandler {
             }
         }
         return null;
+    }
+
+    getAllActiveCalls() {
+        const activeCalls = [];
+
+        for (const call of this.calls.values()) {
+            if (call.state !== CallState.Ended && call.state !== CallState.Ringing) {
+                activeCalls.push(call);
+            }
+        }
+        return activeCalls;
+    }
+
+    getAllActiveCallsNotInRoom(notInThisRoomId) {
+        const callsNotInThatRoom = [];
+
+        for (const [roomId, call] of this.calls.entries()) {
+            if (roomId !== notInThisRoomId && call.state !== CallState.Ended) {
+                callsNotInThatRoom.push(call);
+            }
+        }
+        return callsNotInThatRoom;
+    }
+
+    getTransfereeForCallId(callId: string): MatrixCall {
+        return this.transferees[callId];
     }
 
     play(audioId: AudioID) {
@@ -222,11 +387,15 @@ export default class CallHandler {
         // We don't allow placing more than one call per room, but that doesn't mean there
         // can't be more than one, eg. in a glare situation. This checks that the given call
         // is the call we consider 'the' call for its room.
-        const callForThisRoom = this.getCallForRoom(call.roomId);
+        const mappedRoomId = this.roomIdForCall(call);
+
+        const callForThisRoom = this.getCallForRoom(mappedRoomId);
         return callForThisRoom && call.callId === callForThisRoom.callId;
     }
 
     private setCallListeners(call: MatrixCall) {
+        let mappedRoomId = CallHandler.sharedInstance().roomIdForCall(call);
+
         call.on(CallEvent.Error, (err: CallError) => {
             if (!this.matchesCallForThisRoom(call)) return;
 
@@ -256,7 +425,7 @@ export default class CallHandler {
 
             Analytics.trackEvent('voip', 'callHangup');
 
-            this.removeCallForRoom(call.roomId);
+            this.removeCallForRoom(mappedRoomId);
         });
         call.on(CallEvent.State, (newState: CallState, oldState: CallState) => {
             if (!this.matchesCallForThisRoom(call)) return;
@@ -280,8 +449,9 @@ export default class CallHandler {
                     this.play(AudioID.Ringback);
                     break;
                 case CallState.Ended:
+                {
                     Analytics.trackEvent('voip', 'callEnded', 'hangupReason', call.hangupReason);
-                    this.removeCallForRoom(call.roomId);
+                    this.removeCallForRoom(mappedRoomId);
                     if (oldState === CallState.InviteSent && (
                         call.hangupParty === CallParty.Remote ||
                         (call.hangupParty === CallParty.Local && call.hangupReason === CallErrorCode.InviteTimeout)
@@ -292,6 +462,9 @@ export default class CallHandler {
                         if (call.hangupReason === CallErrorCode.UserHangup) {
                             title = _t("Call Declined");
                             description = _t("The other party declined the call.");
+                        } else if (call.hangupReason === CallErrorCode.UserBusy) {
+                            title = _t("User Busy");
+                            description = _t("The user you called is busy.");
                         } else if (call.hangupReason === CallErrorCode.InviteTimeout) {
                             title = _t("Call Failed");
                             // XXX: full stop appended as some relic here, but these
@@ -313,9 +486,14 @@ export default class CallHandler {
                             title: _t("Answered Elsewhere"),
                             description: _t("The call was answered on another device."),
                         });
-                    } else {
+                    } else if (oldState !== CallState.Fledgling && oldState !== CallState.Ringing) {
+                        // don't play the end-call sound for calls that never got off the ground
                         this.play(AudioID.CallEnd);
                     }
+
+                    this.logCallStats(call, mappedRoomId);
+                    break;
+                }
             }
         });
         call.on(CallEvent.Replaced, (newCall: MatrixCall) => {
@@ -329,31 +507,106 @@ export default class CallHandler {
                 this.pause(AudioID.Ringback);
             }
 
-            this.calls.set(newCall.roomId, newCall);
+            this.calls.set(mappedRoomId, newCall);
+            this.emit(CallHandlerEvent.CallsChanged, this.calls);
             this.setCallListeners(newCall);
             this.setCallState(newCall, newCall.state);
         });
+        call.on(CallEvent.AssertedIdentityChanged, async () => {
+            if (!this.matchesCallForThisRoom(call)) return;
+
+            console.log(`Call ID ${call.callId} got new asserted identity:`, call.getRemoteAssertedIdentity());
+
+            const newAssertedIdentity = call.getRemoteAssertedIdentity().id;
+            let newNativeAssertedIdentity = newAssertedIdentity;
+            if (newAssertedIdentity) {
+                const response = await this.sipNativeLookup(newAssertedIdentity);
+                if (response.length) newNativeAssertedIdentity = response[0].userid;
+            }
+            console.log(`Asserted identity ${newAssertedIdentity} mapped to ${newNativeAssertedIdentity}`);
+
+            if (newNativeAssertedIdentity) {
+                this.assertedIdentityNativeUsers[call.callId] = newNativeAssertedIdentity;
+
+                // If we don't already have a room with this user, make one. This will be slightly odd
+                // if they called us because we'll be inviting them, but there's not much we can do about
+                // this if we want the actual, native room to exist (which we do). This is why it's
+                // important to only obey asserted identity in trusted environments, since anyone you're
+                // on a call with can cause you to send a room invite to someone.
+                await ensureDMExists(MatrixClientPeg.get(), newNativeAssertedIdentity);
+
+                const newMappedRoomId = this.roomIdForCall(call);
+                console.log(`Old room ID: ${mappedRoomId}, new room ID: ${newMappedRoomId}`);
+                if (newMappedRoomId !== mappedRoomId) {
+                    this.removeCallForRoom(mappedRoomId);
+                    mappedRoomId = newMappedRoomId;
+                    this.calls.set(mappedRoomId, call);
+                    this.emit(CallHandlerEvent.CallChangeRoom, call);
+                }
+            }
+        });
     }
 
-    private setCallAudioElement(call: MatrixCall) {
-        const audioElement = getRemoteAudioElement();
-        if (audioElement) call.setRemoteAudioElement(audioElement);
+    private async logCallStats(call: MatrixCall, mappedRoomId: string) {
+        const stats = await call.getCurrentCallStats();
+        logger.debug(
+            `Call completed. Call ID: ${call.callId}, virtual room ID: ${call.roomId}, ` +
+            `user-facing room ID: ${mappedRoomId}, direction: ${call.direction}, ` +
+            `our Party ID: ${call.ourPartyId}, hangup party: ${call.hangupParty}, ` +
+            `hangup reason: ${call.hangupReason}`,
+        );
+        if (!stats) {
+            logger.debug(
+                "Call statistics are undefined. The call has " +
+                "probably failed before a peerConn was established",
+            );
+            return;
+        }
+        logger.debug("Local candidates:");
+        for (const cand of stats.filter(item => item.type === 'local-candidate')) {
+            const address = cand.address || cand.ip; // firefox uses 'address', chrome uses 'ip'
+            logger.debug(
+                `${cand.id} - type: ${cand.candidateType}, address: ${address}, port: ${cand.port}, ` +
+                `protocol: ${cand.protocol}, relay protocol: ${cand.relayProtocol}, network type: ${cand.networkType}`,
+            );
+        }
+        logger.debug("Remote candidates:");
+        for (const cand of stats.filter(item => item.type === 'remote-candidate')) {
+            const address = cand.address || cand.ip; // firefox uses 'address', chrome uses 'ip'
+            logger.debug(
+                `${cand.id} - type: ${cand.candidateType}, address: ${address}, port: ${cand.port}, ` +
+                `protocol: ${cand.protocol}`,
+            );
+        }
+        logger.debug("Candidate pairs:");
+        for (const pair of stats.filter(item => item.type === 'candidate-pair')) {
+            logger.debug(
+                `${pair.localCandidateId} / ${pair.remoteCandidateId} - state: ${pair.state}, ` +
+                `nominated: ${pair.nominated}, ` +
+                `requests sent ${pair.requestsSent}, requests received  ${pair.requestsReceived},  ` +
+                `responses received: ${pair.responsesReceived}, responses sent: ${pair.responsesSent}, ` +
+                `bytes received: ${pair.bytesReceived}, bytes sent: ${pair.bytesSent}, `,
+            );
+        }
     }
 
     private setCallState(call: MatrixCall, status: CallState) {
+        const mappedRoomId = CallHandler.sharedInstance().roomIdForCall(call);
+
         console.log(
-            `Call state in ${call.roomId} changed to ${status}`,
+            `Call state in ${mappedRoomId} changed to ${status}`,
         );
 
         dis.dispatch({
             action: 'call_state',
-            room_id: call.roomId,
+            room_id: mappedRoomId,
             state: status,
         });
     }
 
     private removeCallForRoom(roomId: string) {
         this.calls.delete(roomId);
+        this.emit(CallHandlerEvent.CallsChanged, this.calls);
     }
 
     private showICEFallbackPrompt() {
@@ -393,14 +646,14 @@ export default class CallHandler {
             title = _t("Unable to access microphone");
             description = <div>
                 {_t(
-                    "Call failed because no microphone could not be accessed. " +
+                    "Call failed because microphone could not be accessed. " +
                     "Check that a microphone is plugged in and set up correctly.",
                 )}
             </div>;
         } else if (call.type === CallType.Video) {
             title = _t("Unable to access webcam / microphone");
             description = <div>
-                {_t("Call failed because no webcam or microphone could not be accessed. Check that:")}
+                {_t("Call failed because webcam or microphone could not be accessed. Check that:")}
                 <ul>
                     <li>{_t("A microphone and webcam are plugged in and set up correctly")}</li>
                     <li>{_t("Permission is granted to use the webcam")}</li>
@@ -414,24 +667,31 @@ export default class CallHandler {
         }, null, true);
     }
 
-    private placeCall(
-        roomId: string, type: PlaceCallType,
-        localElement: HTMLVideoElement, remoteElement: HTMLVideoElement,
-    ) {
+    private async placeCall(roomId: string, type: PlaceCallType, transferee: MatrixCall) {
         Analytics.trackEvent('voip', 'placeCall', 'type', type);
         CountlyAnalytics.instance.trackStartCall(roomId, type === PlaceCallType.Video, false);
-        const call = createNewMatrixCall(MatrixClientPeg.get(), roomId);
+
+        const mappedRoomId = (await VoipUserMapper.sharedInstance().getOrCreateVirtualRoomForRoom(roomId)) || roomId;
+        logger.debug("Mapped real room " + roomId + " to room ID " + mappedRoomId);
+
+        const timeUntilTurnCresExpire = MatrixClientPeg.get().getTurnServersExpiry() - Date.now();
+        console.log("Current turn creds expire in " + timeUntilTurnCresExpire + " ms");
+        const call = MatrixClientPeg.get().createCall(mappedRoomId);
+
         this.calls.set(roomId, call);
+        this.emit(CallHandlerEvent.CallsChanged, this.calls);
+        if (transferee) {
+            this.transferees[call.callId] = transferee;
+        }
+
         this.setCallListeners(call);
-        this.setCallAudioElement(call);
+
+        this.setActiveCallRoomId(roomId);
 
         if (type === PlaceCallType.Voice) {
             call.placeVoiceCall();
         } else if (type === 'video') {
-            call.placeVideoCall(
-                remoteElement,
-                localElement,
-            );
+            call.placeVideoCall();
         } else if (type === PlaceCallType.ScreenSharing) {
             const screenCapErrorString = PlatformPeg.get().screenCaptureErrorString();
             if (screenCapErrorString) {
@@ -443,9 +703,16 @@ export default class CallHandler {
                 });
                 return;
             }
-            call.placeScreenSharingCall(remoteElement, localElement);
+
+            call.placeScreenSharingCall(
+                async (): Promise<DesktopCapturerSource> => {
+                    const {finished} = Modal.createDialog(DesktopCapturerSourcePicker);
+                    const [source] = await finished;
+                    return source;
+                },
+            );
         } else {
-            console.error("Unknown conf call type: %s", type);
+            console.error("Unknown conf call type: " + type);
         }
     }
 
@@ -453,12 +720,10 @@ export default class CallHandler {
         switch (payload.action) {
             case 'place_call':
                 {
-                    if (this.getAnyActiveCall()) {
-                        Modal.createTrackedDialog('Call Handler', 'Existing Call', ErrorDialog, {
-                            title: _t('Existing Call'),
-                            description: _t('You are already in a call.'),
-                        });
-                        return; // don't allow >1 call to be placed.
+                    // We might be using managed hybrid widgets
+                    if (isManagedHybridWidgetEnabled()) {
+                        addManagedHybridWidget(payload.room_id);
+                        return;
                     }
 
                     // if the runtime env doesn't do VoIP, whine.
@@ -470,9 +735,26 @@ export default class CallHandler {
                         return;
                     }
 
+                    // don't allow > 2 calls to be placed.
+                    if (this.getAllActiveCalls().length > 1) {
+                        Modal.createTrackedDialog('Call Handler', 'Existing Call', ErrorDialog, {
+                            title: _t('Too Many Calls'),
+                            description: _t("You've reached the maximum number of simultaneous calls."),
+                        });
+                        return;
+                    }
+
                     const room = MatrixClientPeg.get().getRoom(payload.room_id);
                     if (!room) {
-                        console.error("Room %s does not exist.", payload.room_id);
+                        console.error(`Room ${payload.room_id} does not exist.`);
+                        return;
+                    }
+
+                    if (this.getCallForRoom(room.roomId)) {
+                        Modal.createTrackedDialog('Call Handler', 'Existing Call with user', ErrorDialog, {
+                            title: _t('Already in call'),
+                            description: _t("You're already in a call with this person."),
+                        });
                         return;
                     }
 
@@ -483,54 +765,57 @@ export default class CallHandler {
                         });
                         return;
                     } else if (members.length === 2) {
-                        console.info("Place %s call in %s", payload.type, payload.room_id);
+                        console.info(`Place ${payload.type} call in ${payload.room_id}`);
 
-                        this.placeCall(payload.room_id, payload.type, payload.local_element, payload.remote_element);
+                        this.placeCall(payload.room_id, payload.type, payload.transferee);
                     } else { // > 2
                         dis.dispatch({
                             action: "place_conference_call",
                             room_id: payload.room_id,
                             type: payload.type,
-                            remote_element: payload.remote_element,
-                            local_element: payload.local_element,
                         });
                     }
                 }
                 break;
             case 'place_conference_call':
-                console.info("Place conference call in %s", payload.room_id);
+                console.info("Place conference call in " + payload.room_id);
                 Analytics.trackEvent('voip', 'placeConferenceCall');
                 CountlyAnalytics.instance.trackStartCall(payload.room_id, payload.type === PlaceCallType.Video, true);
                 this.startCallApp(payload.room_id, payload.type);
                 break;
             case 'end_conference':
-                console.info("Terminating conference call in %s", payload.room_id);
+                console.info("Terminating conference call in " + payload.room_id);
                 this.terminateCallApp(payload.room_id);
                 break;
             case 'hangup_conference':
-                console.info("Leaving conference call in %s", payload.room_id);
+                console.info("Leaving conference call in "+ payload.room_id);
                 this.hangupCallApp(payload.room_id);
                 break;
             case 'incoming_call':
                 {
-                    if (this.getAnyActiveCall()) {
-                        // ignore multiple incoming calls. in future, we may want a line-1/line-2 setup.
-                        // we avoid rejecting with "busy" in case the user wants to answer it on a different device.
-                        // in future we could signal a "local busy" as a warning to the caller.
-                        // see https://github.com/vector-im/vector-web/issues/1964
-                        return;
-                    }
-
                     // if the runtime env doesn't do VoIP, stop here.
                     if (!MatrixClientPeg.get().supportsVoip()) {
                         return;
                     }
 
                     const call = payload.call as MatrixCall;
+
+                    const mappedRoomId = CallHandler.sharedInstance().roomIdForCall(call);
+                    if (this.getCallForRoom(mappedRoomId)) {
+                        // ignore multiple incoming calls to the same room
+                        return;
+                    }
+
                     Analytics.trackEvent('voip', 'receiveCall', 'type', call.type);
-                    this.calls.set(call.roomId, call)
+                    this.calls.set(mappedRoomId, call)
+                    this.emit(CallHandlerEvent.CallsChanged, this.calls);
                     this.setCallListeners(call);
-                    this.setCallAudioElement(call);
+
+                    // get ready to send encrypted events in the room, so if the user does answer
+                    // the call, we'll be ready to send. NB. This is the protocol-level room ID not
+                    // the mapped one: that's where we'll send the events.
+                    const cli = MatrixClientPeg.get();
+                    cli.prepareToEncrypt(cli.getRoom(call.roomId));
                 }
                 break;
             case 'hangup':
@@ -543,14 +828,30 @@ export default class CallHandler {
                 } else {
                     this.calls.get(payload.room_id).hangup(CallErrorCode.UserHangup, false);
                 }
-                this.removeCallForRoom(payload.room_id);
+                // don't remove the call yet: let the hangup event handler do it (otherwise it will throw
+                // the hangup event away)
+                break;
+            case 'hangup_all':
+                for (const call of this.calls.values()) {
+                    call.hangup(CallErrorCode.UserHangup, false);
+                }
                 break;
             case 'answer': {
                 if (!this.calls.has(payload.room_id)) {
                     return; // no call to answer
                 }
+
+                if (this.getAllActiveCalls().length > 1) {
+                    Modal.createTrackedDialog('Call Handler', 'Existing Call', ErrorDialog, {
+                        title: _t('Too Many Calls'),
+                        description: _t("You've reached the maximum number of simultaneous calls."),
+                    });
+                    return;
+                }
+
                 const call = this.calls.get(payload.room_id);
                 call.answer();
+                this.setActiveCallRoomId(payload.room_id);
                 CountlyAnalytics.instance.trackJoinCall(payload.room_id, call.type === CallType.Video, false);
                 dis.dispatch({
                     action: "view_room",
@@ -559,6 +860,33 @@ export default class CallHandler {
                 break;
             }
         }
+    }
+
+    setActiveCallRoomId(activeCallRoomId: string) {
+        logger.info("Setting call in room " + activeCallRoomId + " active");
+
+        for (const [roomId, call] of this.calls.entries()) {
+            if (call.state === CallState.Ended) continue;
+
+            if (roomId === activeCallRoomId) {
+                call.setRemoteOnHold(false);
+            } else {
+                logger.info("Holding call in room " + roomId + " because another call is being set active");
+                call.setRemoteOnHold(true);
+            }
+        }
+    }
+
+    /**
+     * @returns true if we are currently in any call where we haven't put the remote party on hold
+     */
+    hasAnyUnheldCall() {
+        for (const call of this.calls.values()) {
+            if (call.state === CallState.Ended) continue;
+            if (!call.isRemoteOnHold()) return true;
+        }
+
+        return false;
     }
 
     private async startCallApp(roomId: string, type: string) {
@@ -590,8 +918,9 @@ export default class CallHandler {
             // https://github.com/matrix-org/prosody-mod-auth-matrix-user-verification
             confId = base32.stringify(Buffer.from(roomId), { pad: false });
         } else {
-            // Create a random human readable conference ID
-            confId = `JitsiConference${generateHumanReadableId()}`;
+            // Create a random conference ID
+            const random = randomUppercaseString(1) + randomLowercaseString(23);
+            confId = 'Jitsi' + random;
         }
 
         let widgetUrl = WidgetUtils.getLocalJitsiWrapperUrl({auth: jitsiAuth});
@@ -607,6 +936,7 @@ export default class CallHandler {
             isAudioOnly: type === 'voice',
             domain: jitsiDomain,
             auth: jitsiAuth,
+            roomName: room.name,
         };
 
         const widgetId = (

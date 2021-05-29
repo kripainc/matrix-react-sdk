@@ -28,6 +28,7 @@ import * as rageshake from './rageshake';
 // polyfill textencoder if necessary
 import * as TextEncodingUtf8 from 'text-encoding-utf-8';
 import SettingsStore from "../settings/SettingsStore";
+import SdkConfig from "../SdkConfig";
 let TextEncoder = window.TextEncoder;
 if (!TextEncoder) {
     TextEncoder = TextEncodingUtf8.TextEncoder;
@@ -235,7 +236,7 @@ export async function downloadBugReport(opts: IOpts = {}) {
     let i = 0;
     for (const [key, value] of body.entries()) {
         if (key === 'compressed-log') {
-            await new Promise((resolve => {
+            await new Promise<void>((resolve => {
                 const reader = new FileReader();
                 reader.addEventListener('loadend', ev => {
                     tape.append(`log-${i++}.log`, new TextDecoder().decode(ev.target.result as ArrayBuffer));
@@ -268,8 +269,27 @@ function uint8ToString(buf: Buffer) {
     return out;
 }
 
+export async function submitFeedback(endpoint: string, label: string, comment: string, canContact = false) {
+    let version = "UNKNOWN";
+    try {
+        version = await PlatformPeg.get().getAppVersion();
+    } catch (err) {} // PlatformPeg already logs this.
+
+    const body = new FormData();
+    body.append("label", label);
+    body.append("text", comment);
+    body.append("can_contact", canContact ? "yes" : "no");
+
+    body.append("app", "element-web");
+    body.append("version", version);
+    body.append("platform", PlatformPeg.get().getHumanReadableName());
+    body.append("user_id", MatrixClientPeg.get()?.getUserId());
+
+    await _submitReport(SdkConfig.get().bug_report_endpoint_url, body, () => {});
+}
+
 function _submitReport(endpoint: string, body: FormData, progressCallback: (string) => void) {
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
         const req = new XMLHttpRequest();
         req.open("POST", endpoint);
         req.timeout = 5 * 60 * 1000;

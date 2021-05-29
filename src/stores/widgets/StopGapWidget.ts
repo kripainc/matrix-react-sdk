@@ -1,5 +1,5 @@
 /*
- * Copyright 2020 The Matrix.org Foundation C.I.C.
+ * Copyright 2020, 2021 The Matrix.org Foundation C.I.C.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -52,6 +52,8 @@ import {getCustomTheme} from "../../theme";
 import CountlyAnalytics from "../../CountlyAnalytics";
 import { ElementWidgetCapabilities } from "./ElementWidgetCapabilities";
 import { MatrixEvent } from "matrix-js-sdk/src/models/event";
+import { ELEMENT_CLIENT_ID } from "../../identifiers";
+import { getUserLanguage } from "../../languageHandler";
 
 // TODO: Destroy all of this code
 
@@ -190,10 +192,13 @@ export class StopGapWidget extends EventEmitter {
 
     private runUrlTemplate(opts = {asPopout: false}): string {
         const templated = this.mockWidget.getCompleteUrl({
-            currentRoomId: RoomViewStore.getRoomId(),
+            widgetRoomId: this.roomId,
             currentUserId: MatrixClientPeg.get().getUserId(),
             userDisplayName: OwnProfileStore.instance.displayName,
             userHttpAvatarUrl: OwnProfileStore.instance.getHttpAvatarUrl(),
+            clientId: ELEMENT_CLIENT_ID,
+            clientTheme: SettingsStore.getValue("theme"),
+            clientLanguage: getUserLanguage(),
         }, opts?.asPopout);
 
         const parsed = new URL(templated);
@@ -395,6 +400,7 @@ export class StopGapWidget extends EventEmitter {
     }
 
     private onEvent = (ev: MatrixEvent) => {
+        MatrixClientPeg.get().decryptEventIfNeeded(ev);
         if (ev.isBeingDecrypted() || ev.isDecryptionFailure()) return;
         if (ev.getRoomId() !== this.eventListenerRoomId) return;
         this.feedEvent(ev);

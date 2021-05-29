@@ -60,6 +60,9 @@ export class CapabilityText {
         [ElementWidgetCapabilities.CanChangeViewedRoom]: {
             [GENERIC_WIDGET_KIND]: _td("Change which room you're viewing"),
         },
+        [MatrixCapabilities.MSC2931Navigate]: {
+            [GENERIC_WIDGET_KIND]: _td("Change which room, message, or user you're viewing"),
+        },
     };
 
     private static stateSendRecvCaps: ISendRecvStaticCapText = {
@@ -91,6 +94,16 @@ export class CapabilityText {
             [GENERIC_WIDGET_KIND]: {
                 [EventDirection.Send]: _td("Change the avatar of your active room"),
                 [EventDirection.Receive]: _td("See when the avatar changes in your active room"),
+            },
+        },
+        [EventType.RoomMember]: {
+            [WidgetKind.Room]: {
+                [EventDirection.Send]: _td("Kick, ban, or invite people to this room, and make you leave"),
+                [EventDirection.Receive]: _td("See when people join, leave, or are invited to this room"),
+            },
+            [GENERIC_WIDGET_KIND]: {
+                [EventDirection.Send]: _td("Kick, ban, or invite people to your active room, and make you leave"),
+                [EventDirection.Receive]: _td("See when people join, leave, or are invited to your active room"),
             },
         },
     };

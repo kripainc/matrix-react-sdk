@@ -15,7 +15,10 @@
  */
 
 import {Room} from "matrix-js-sdk/src/models/room";
+import CallHandler from "../../../CallHandler";
 import { RoomListCustomisations } from "../../../customisations/RoomList";
+import VoipUserMapper from "../../../VoipUserMapper";
+import SettingsStore from "../../../settings/SettingsStore";
 
 export class VisibilityProvider {
     private static internalInstance: VisibilityProvider;
@@ -30,25 +33,32 @@ export class VisibilityProvider {
         return VisibilityProvider.internalInstance;
     }
 
-    public isRoomVisible(room: Room): boolean {
-        /* eslint-disable prefer-const */
-        let isVisible = true; // Returned at the end of this function
-        let forced = false; // When true, this function won't bother calling the customisation points
-        /* eslint-enable prefer-const */
+    public async onNewInvitedRoom(room: Room) {
+        await VoipUserMapper.sharedInstance().onNewInvitedRoom(room);
+    }
 
-        // ------
-        // TODO: The `if` statements to control visibility of custom room types
-        // would go here. The remainder of this function assumes that the statements
-        // will be here.
-        //
-        // When removing this comment block, please remove the lint disable lines in the area.
-        // ------
-
-        const isVisibleFn = RoomListCustomisations.isRoomVisible;
-        if (!forced && isVisibleFn) {
-            isVisible = isVisibleFn(room);
+    public isRoomVisible(room?: Room): boolean {
+        if (!room) {
+            return false;
         }
 
-        return isVisible;
+        if (
+            CallHandler.sharedInstance().getSupportsVirtualRooms() &&
+            VoipUserMapper.sharedInstance().isVirtualRoom(room)
+        ) {
+            return false;
+        }
+
+        // hide space rooms as they'll be shown in the SpacePanel
+        if (SettingsStore.getValue("feature_spaces") && room.isSpaceRoom()) {
+            return false;
+        }
+
+        const isVisibleFn = RoomListCustomisations.isRoomVisible;
+        if (isVisibleFn) {
+            return isVisibleFn(room);
+        }
+
+        return true; // default
     }
 }

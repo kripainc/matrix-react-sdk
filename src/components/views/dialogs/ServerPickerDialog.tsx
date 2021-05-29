@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Matrix.org Foundation C.I.C.
+Copyright 2020-2021 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -14,7 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-import React, {createRef} from 'react';
+import React, {createRef} from "react";
+import {AutoDiscovery} from "matrix-js-sdk/src/autodiscovery";
 
 import AutoDiscoveryUtils, {ValidatedServerConfig} from "../../../utils/AutoDiscoveryUtils";
 import BaseDialog from './BaseDialog';
@@ -25,6 +26,7 @@ import Field from "../elements/Field";
 import StyledRadioButton from "../elements/StyledRadioButton";
 import TextWithTooltip from "../elements/TextWithTooltip";
 import withValidation, {IFieldState} from "../elements/Validation";
+import {replaceableComponent} from "../../../utils/replaceableComponent";
 
 interface IProps {
     title?: string;
@@ -37,6 +39,7 @@ interface IState {
     otherHomeserver: string;
 }
 
+@replaceableComponent("views.dialogs.ServerPickerDialog")
 export default class ServerPickerDialog extends React.PureComponent<IProps, IState> {
     private readonly defaultServer: ValidatedServerConfig;
     private readonly fieldRef = createRef<Field>();
@@ -47,9 +50,20 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
 
         const config = SdkConfig.get();
         this.defaultServer = config["validated_server_config"] as ValidatedServerConfig;
+        const { serverConfig } = this.props;
+
+        let otherHomeserver = "";
+        if (!serverConfig.isDefault) {
+            if (serverConfig.isNameResolvable && serverConfig.hsName) {
+                otherHomeserver = serverConfig.hsName;
+            } else {
+                otherHomeserver = serverConfig.hsUrl;
+            }
+        }
+
         this.state = {
-            defaultChosen: this.props.serverConfig.isDefault,
-            otherHomeserver: this.props.serverConfig.isDefault ? "" : this.props.serverConfig.hsUrl,
+            defaultChosen: serverConfig.isDefault,
+            otherHomeserver,
         };
     }
 
@@ -69,10 +83,25 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
     // If for some reason someone enters "matrix.org" for a URL, we could do a lookup to
     // find their homeserver without demanding they use "https://matrix.org"
     private validate = withValidation<this, { error?: string }>({
-        deriveData: async ({ value: hsUrl }) => {
-            // Always try and use the defaults first
-            const defaultConfig: ValidatedServerConfig = SdkConfig.get()["validated_server_config"];
-            if (defaultConfig.hsUrl === hsUrl) return {};
+        deriveData: async ({ value }) => {
+            let hsUrl = value.trim(); // trim to account for random whitespace
+
+            // if the URL has no protocol, try validate it as a serverName via well-known
+            if (!hsUrl.includes("://")) {
+                try {
+                    const discoveryResult = await AutoDiscovery.findClientConfig(hsUrl);
+                    this.validatedConf = AutoDiscoveryUtils.buildValidatedConfigFromDiscovery(hsUrl, discoveryResult);
+                    return {}; // we have a validated config, we don't need to try the other paths
+                } catch (e) {
+                    console.error(`Attempted ${hsUrl} as a server_name but it failed`, e);
+                }
+            }
+
+            // if we got to this stage then either the well-known failed or the URL had a protocol specified,
+            // so validate statically only. If the URL has no protocol, default to https.
+            if (!hsUrl.includes("://")) {
+                hsUrl = "https://" + hsUrl;
+            }
 
             try {
                 this.validatedConf = await AutoDiscoveryUtils.validateServerConfigWithStaticUrls(hsUrl);
@@ -81,16 +110,21 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
                 console.error(e);
 
                 const stateForError = AutoDiscoveryUtils.authComponentStateForError(e);
-                if (!stateForError.isFatalError) {
-                    // carry on anyway
-                    this.validatedConf = await AutoDiscoveryUtils.validateServerConfigWithStaticUrls(hsUrl, null, true);
-                    return {};
-                } else {
-                    let error = _t("Unable to validate homeserver/identity server");
+                if (stateForError.serverErrorIsFatal) {
+                    let error = _t("Unable to validate homeserver");
                     if (e.translatedMessage) {
                         error = e.translatedMessage;
                     }
                     return { error };
+                }
+
+                // try to carry on anyway
+                try {
+                    this.validatedConf = await AutoDiscoveryUtils.validateServerConfigWithStaticUrls(hsUrl, null, true);
+                    return {};
+                } catch (e) {
+                    console.error(e);
+                    return { error: _t("Invalid URL") };
                 }
             }
         },
@@ -119,13 +153,13 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
 
         const valid = await this.fieldRef.current.validate({ allowEmpty: false });
 
-        if (!valid) {
+        if (!valid && !this.state.defaultChosen) {
             this.fieldRef.current.focus();
             this.fieldRef.current.validate({ allowEmpty: false, focused: true });
             return;
         }
 
-        this.props.onFinished(this.validatedConf);
+        this.props.onFinished(this.state.defaultChosen ? this.defaultServer : this.validatedConf);
     };
 
     public render() {
@@ -134,7 +168,7 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
             text = _t("Matrix.org is the biggest public homeserver in the world, so it’s a good place for many.");
         }
 
-        let defaultServerName = this.defaultServer.hsName;
+        let defaultServerName: React.ReactNode = this.defaultServer.hsName;
         if (this.defaultServer.hsNameIsDifferent) {
             defaultServerName = (
                 <TextWithTooltip class="mx_Login_underlinedServerName" tooltip={this.defaultServer.hsUrl}>
@@ -153,7 +187,7 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
         >
             <form className="mx_Dialog_content" id="mx_ServerPickerDialog" onSubmit={this.onSubmit}>
                 <p>
-                    {_t("We call the places you where you can host your account ‘homeservers’.")} {text}
+                    {_t("We call the places where you can host your account ‘homeservers’.")} {text}
                 </p>
 
                 <StyledRadioButton
@@ -183,6 +217,7 @@ export default class ServerPickerDialog extends React.PureComponent<IProps, ISta
                         value={this.state.otherHomeserver}
                         validateOnChange={false}
                         validateOnFocus={false}
+                        id="mx_homeserverInput"
                     />
                 </StyledRadioButton>
                 <p>

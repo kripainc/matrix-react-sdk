@@ -1,5 +1,5 @@
 /*
-Copyright 2020 The Matrix.org Foundation C.I.C.
+Copyright 2020, 2021 The Matrix.org Foundation C.I.C.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -16,7 +16,7 @@ limitations under the License.
 
 import * as React from 'react';
 import BaseDialog from './BaseDialog';
-import { _t } from '../../../languageHandler';
+import { _t, getUserLanguage } from '../../../languageHandler';
 import AccessibleButton from "../elements/AccessibleButton";
 import {
     ClientWidgetApi,
@@ -35,13 +35,16 @@ import {
 } from "matrix-widget-api";
 import {StopGapWidgetDriver} from "../../../stores/widgets/StopGapWidgetDriver";
 import {MatrixClientPeg} from "../../../MatrixClientPeg";
-import RoomViewStore from "../../../stores/RoomViewStore";
 import {OwnProfileStore} from "../../../stores/OwnProfileStore";
 import { arrayFastClone } from "../../../utils/arrays";
 import { ElementWidget } from "../../../stores/widgets/StopGapWidget";
+import {replaceableComponent} from "../../../utils/replaceableComponent";
+import {ELEMENT_CLIENT_ID} from "../../../identifiers";
+import SettingsStore from "../../../settings/SettingsStore";
 
 interface IProps {
     widgetDefinition: IModalWidgetOpenRequestData;
+    widgetRoomId?: string;
     sourceWidgetId: string;
     onFinished(success: boolean, data?: IModalWidgetReturnData): void;
 }
@@ -53,6 +56,7 @@ interface IState {
 
 const MAX_BUTTONS = 3;
 
+@replaceableComponent("views.dialogs.ModalWidgetDialog")
 export default class ModalWidgetDialog extends React.PureComponent<IProps, IState> {
     private readonly widget: Widget;
     private readonly possibleButtons: ModalButtonID[];
@@ -123,10 +127,13 @@ export default class ModalWidgetDialog extends React.PureComponent<IProps, IStat
 
     public render() {
         const templated = this.widget.getCompleteUrl({
-            currentRoomId: RoomViewStore.getRoomId(),
+            widgetRoomId: this.props.widgetRoomId,
             currentUserId: MatrixClientPeg.get().getUserId(),
             userDisplayName: OwnProfileStore.instance.displayName,
             userHttpAvatarUrl: OwnProfileStore.instance.getHttpAvatarUrl(),
+            clientId: ELEMENT_CLIENT_ID,
+            clientTheme: SettingsStore.getValue("theme"),
+            clientLanguage: getUserLanguage(),
         });
 
         const parsed = new URL(templated);
